@@ -4,8 +4,8 @@
 from learnrl.estimators import Estimator
 
 import numpy as np
-from keras.models import Model, clone_model
-import keras.backend as K
+from tensorflow.keras.models import Model, clone_model
+import tensorflow as tf
 
 class KerasEstimator(Estimator):
 
@@ -25,17 +25,19 @@ class KerasEstimator(Estimator):
     def build(self, **kwargs):
         raise NotImplementedError
 
-    def preprocess(self, observations, actions=None):
+    def preprocess(self, observations:tf.Tensor, actions:tf.Tensor=None):
         raise NotImplementedError
 
     def fit(self, observations, actions, Y):
         logs = {}
 
-        x_train = self.preprocess(observations, actions)
-        y_train = self.model.predict_on_batch(x_train)
-        y_train[np.arange(len(actions)), actions] = Y
-        loss = self.model.train_on_batch(x_train, y_train)
-        logs.update({'loss': loss})
+        observations_tensor = tf.convert_to_tensor(observations)
+        actions_tensor = tf.convert_to_tensor(actions)
+        Y_tensor = tf.convert_to_tensor(Y, dtype=tf.float32)
+
+        metrics = self.train_on_experience_batch(observations_tensor, actions_tensor, Y_tensor)
+        metrics = {key:metrics[key].numpy() for key in metrics}
+        logs.update(metrics)
 
         if self.freezed_steps > 0:
             logs.update({'freezed_update': self.step_freezed_left == 0})
@@ -46,17 +48,33 @@ class KerasEstimator(Estimator):
                     print("Freezed model updated")
             self.step_freezed_left -= 1
         
-        self.update_learning_rate(K.eval(self.model.optimizer.lr))
         return logs
 
+    @tf.function(experimental_relax_shapes=True)
+    def train_on_experience_batch(self, observations:tf.Tensor, actions:tf.Tensor, Y:tf.Tensor):
+        x_train = self.preprocess(observations, actions)
+        y_pred = self.model.predict_step(x_train)
+
+        actions_indices = tf.stack((tf.range(len(actions)), actions), axis=-1)
+        y_action_pred = tf.gather_nd(y_pred, actions_indices)
+        y_train = tf.tensor_scatter_nd_add(y_pred, actions_indices, tf.add(Y, -y_action_pred))
+
+        metrics = self.model.train_step((x_train, y_train))
+        return metrics
+    
     def predict(self, observations, actions=None):
         x = self.preprocess(observations, actions)
-        if self.freezed_steps > 0:
-            Y = self.model_freezed.predict_on_batch(x)
-        else:
-            Y = self.model.predict_on_batch(x)
+        x = tf.convert_to_tensor(x)
+        Y = self.predict_on_experience_batch(x)
         if actions is not None:
             return Y[actions]
         else:
             return Y
 
+    @tf.function(experimental_relax_shapes=True)
+    def predict_on_experience_batch(self, x):
+        if self.freezed_steps > 0:
+            Y = self.model_freezed.predict_step(x)
+        else:
+            Y = self.model.predict_step(x)
+        return Y
